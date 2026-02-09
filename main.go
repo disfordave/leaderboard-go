@@ -13,7 +13,7 @@ import (
 
 type scoreUpdateRequest struct {
 	UserID string  `json:"userId"`
-	Delta  float64 `json:"delta"`
+	Delta  int64 `json:"delta"`
 }
 
 type scoreUpdateResponse struct {
@@ -107,7 +107,7 @@ func main() {
 		ctx, cancel := context.WithTimeout(r.Context(), 300*time.Millisecond)
 		defer cancel()
 
-		score, err := rdb.ZIncrBy(ctx, key, req.Delta, req.UserID).Result()
+		score, err := rdb.ZIncrBy(ctx, key, float64(req.Delta), req.UserID).Result()
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "redis error"})
 			return
