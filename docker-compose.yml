@@ -15,7 +15,6 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-leaderboard}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-leaderboard}
       POSTGRES_DB: ${POSTGRES_DB:-leaderboard}
-    ports: [ "5432:5432" ]
     restart: unless-stopped
     volumes:
       - pgdata:/var/lib/postgresql/data
