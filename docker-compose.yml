@@ -1,13 +1,25 @@
 services:
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      REDIS_ADDR: ${REDIS_ADDR}
+      POSTGRES_DSN: ${POSTGRES_DSN}
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - backend
   redis:
     image: redis:7-alpine
     container_name: leaderboard-go-redis
-    ports:
-      - "6379:6379"
     command: [ "redis-server", "--appendonly", "yes" ]
     volumes:
       - redisdata:/data
     restart: unless-stopped
+    networks:
+      - backend
   postgres:
     image: postgres:16-alpine
     container_name: leaderboard-go-postgres
@@ -18,7 +30,13 @@ services:
     restart: unless-stopped
     volumes:
       - pgdata:/var/lib/postgresql/data
+    networks:
+      - backend
 
 volumes:
   redisdata:
   pgdata:
+
+networks:
+  backend:
+    driver: bridge
