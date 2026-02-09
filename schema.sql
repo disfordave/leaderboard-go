@@ -1,0 +1,7 @@
+CREATE TABLE IF NOT EXISTS score_events (
+  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  season_id  TEXT NOT NULL,
+  user_id    TEXT NOT NULL,
+  delta      BIGINT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
