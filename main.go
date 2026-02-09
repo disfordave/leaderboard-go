@@ -215,6 +215,78 @@ func main() {
 		})
 	})
 
+	// GET /v1/seasons/{sid}/leaderboard/around?userId=...&range=5
+    mux.HandleFunc("GET /v1/seasons/{sid}/leaderboard/around", func(w http.ResponseWriter, r *http.Request) {
+        seasonID := r.PathValue("sid")
+        if seasonID == "" {
+            writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing season id"})
+            return
+        }
+
+        userID := r.URL.Query().Get("userId")
+        if userID == "" {
+            writeJSON(w, http.StatusBadRequest, map[string]any{"error": "userId is required"})
+            return
+        }
+
+        rng := int64(5)
+        if v := r.URL.Query().Get("range"); v != "" {
+            var parsed int64
+            if _, err := fmt.Sscanf(v, "%d", &parsed); err != nil || parsed < 0 || parsed > 100 {
+                writeJSON(w, http.StatusBadRequest, map[string]any{"error": "range must be 0..100"})
+                return
+            }
+            rng = parsed
+        }
+
+        key := fmt.Sprintf("lb:%s", seasonID)
+
+        ctx, cancel := context.WithTimeout(r.Context(), 300*time.Millisecond)
+        defer cancel()
+
+        myRank0, err := rdb.ZRevRank(ctx, key, userID).Result()
+        if err == redis.Nil {
+            writeJSON(w, http.StatusNotFound, map[string]any{"error": "user not found in leaderboard"})
+            return
+        }
+        if err != nil {
+            writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "redis error"})
+            return
+        }
+
+        start := myRank0 - rng
+        if start < 0 {
+            start = 0
+        }
+        end := myRank0 + rng
+
+        zs, err := rdb.ZRevRangeWithScores(ctx, key, start, end).Result()
+        if err != nil {
+            writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "redis error"})
+            return
+        }
+
+        items := make([]aroundItem, 0, len(zs))
+        for i, z := range zs {
+            uid, ok := z.Member.(string)
+            if !ok {
+                uid = fmt.Sprint(z.Member)
+            }
+            items = append(items, aroundItem{
+                Rank:   (start + int64(i)) + 1, // 1-based rank
+                UserID: uid,
+                Score:  z.Score,
+            })
+        }
+
+        writeJSON(w, http.StatusOK, aroundResponse{
+            SeasonID: seasonID,
+            UserID:   userID,
+            Range:    rng,
+            Items:    items,
+        })
+    })
+
 	// DELETE /v1/seasons/{sid}
 	mux.HandleFunc("DELETE /v1/seasons/{sid}", func(w http.ResponseWriter, r *http.Request) {
 		sid := r.PathValue("sid")
