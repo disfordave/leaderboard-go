@@ -12,8 +12,8 @@ import (
 )
 
 type scoreUpdateRequest struct {
-	UserID string  `json:"userId"`
-	Delta  int64 `json:"delta"`
+	UserID string `json:"userId"`
+	Delta  int64  `json:"delta"`
 }
 
 type scoreUpdateResponse struct {
@@ -168,24 +168,71 @@ func main() {
 		})
 	})
 
+	// GET /v1/seasons/{sid}/leaderboard/rank?userId=...
+	mux.HandleFunc("GET /v1/seasons/{sid}/leaderboard/rank", func(w http.ResponseWriter, r *http.Request) {
+		seasonID := r.PathValue("sid")
+		if seasonID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing season id"})
+			return
+		}
+
+		userID := r.URL.Query().Get("userId")
+		if userID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "userId is required"})
+			return
+		}
+
+		key := fmt.Sprintf("lb:%s", seasonID)
+
+		ctx, cancel := context.WithTimeout(r.Context(), 300*time.Millisecond)
+		defer cancel()
+
+		rank0, err := rdb.ZRevRank(ctx, key, userID).Result()
+		if err == redis.Nil {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "user not found in leaderboard"})
+			return
+		}
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "redis error"})
+			return
+		}
+
+		score, err := rdb.ZScore(ctx, key, userID).Result()
+		if err == redis.Nil {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "user not found in leaderboard"})
+			return
+		}
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "redis error"})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, rankResponse{
+			SeasonID: seasonID,
+			UserID:   userID,
+			Rank:     rank0 + 1,
+			Score:    score,
+		})
+	})
+
 	// DELETE /v1/seasons/{sid}
-    mux.HandleFunc("DELETE /v1/seasons/{sid}", func(w http.ResponseWriter, r *http.Request) {
-        sid := r.PathValue("sid")
-        if sid == "" {
-            writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing season id"})
-            return
-        }
+	mux.HandleFunc("DELETE /v1/seasons/{sid}", func(w http.ResponseWriter, r *http.Request) {
+		sid := r.PathValue("sid")
+		if sid == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing season id"})
+			return
+		}
 
-        ctx, cancel := context.WithTimeout(r.Context(), 300*time.Millisecond)
-        defer cancel()
+		ctx, cancel := context.WithTimeout(r.Context(), 300*time.Millisecond)
+		defer cancel()
 
-        key := fmt.Sprintf("lb:%s", sid)
-        if err := rdb.Del(ctx, key).Err(); err != nil {
-            writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "redis error"})
-            return
-        }
-        writeJSON(w, http.StatusOK, map[string]any{"seasonId": sid, "deleted": true})
-    })
+		key := fmt.Sprintf("lb:%s", sid)
+		if err := rdb.Del(ctx, key).Err(); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "redis error"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"seasonId": sid, "deleted": true})
+	})
 
 	fmt.Println("Leaderboard-go Server is starting on http://localhost:8080")
 	if err := http.ListenAndServe(":8080", mux); err != nil {
