@@ -32,14 +32,30 @@ type topResponse struct {
 	Items    []leaderboardItem `json:"items"`
 }
 
+type rankResponse struct {
+	SeasonID string  `json:"seasonId"`
+	UserID   string  `json:"userId"`
+	Rank     int64   `json:"rank"` // 1-based
+	Score    float64 `json:"score"`
+}
+
+type aroundItem struct {
+	Rank   int64   `json:"rank"` // 1-based
+	UserID string  `json:"userId"`
+	Score  float64 `json:"score"`
+}
+
+type aroundResponse struct {
+	SeasonID string       `json:"seasonId"`
+	UserID   string       `json:"userId"`
+	Range    int64        `json:"range"`
+	Items    []aroundItem `json:"items"`
+}
+
 func main() {
 	rdb := newRedisClient()
 
 	mux := http.NewServeMux()
-
-	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "Hello, Go!")
-	})
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
@@ -71,8 +87,12 @@ func main() {
 			return
 		}
 
+		const maxBodyBytes = 1 << 20 // 1 MB
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
 		var req scoreUpdateRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := dec.Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
 			return
 		}
@@ -81,8 +101,8 @@ func main() {
 			return
 		}
 
-		// Key: "go:{seasonID}"
-		key := fmt.Sprintf("go:%s", seasonID)
+		// Key: "lb:{seasonID}"
+		key := fmt.Sprintf("lb:%s", seasonID)
 
 		ctx, cancel := context.WithTimeout(r.Context(), 300*time.Millisecond)
 		defer cancel()
