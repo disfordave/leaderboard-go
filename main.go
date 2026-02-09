@@ -168,6 +168,25 @@ func main() {
 		})
 	})
 
+	// DELETE /v1/seasons/{sid}
+    mux.HandleFunc("DELETE /v1/seasons/{sid}", func(w http.ResponseWriter, r *http.Request) {
+        sid := r.PathValue("sid")
+        if sid == "" {
+            writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing season id"})
+            return
+        }
+
+        ctx, cancel := context.WithTimeout(r.Context(), 300*time.Millisecond)
+        defer cancel()
+
+        key := fmt.Sprintf("lb:%s", sid)
+        if err := rdb.Del(ctx, key).Err(); err != nil {
+            writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "redis error"})
+            return
+        }
+        writeJSON(w, http.StatusOK, map[string]any{"seasonId": sid, "deleted": true})
+    })
+
 	fmt.Println("Leaderboard-go Server is starting on http://localhost:8080")
 	if err := http.ListenAndServe(":8080", mux); err != nil {
 		fmt.Println("Error starting server:", err)
