@@ -120,6 +120,54 @@ func main() {
 		})
 	})
 
+	// GET /v1/seasons/{sid}/leaderboard/top?limit=10
+	mux.HandleFunc("GET /v1/seasons/{sid}/leaderboard/top", func(w http.ResponseWriter, r *http.Request) {
+		seasonID := r.PathValue("sid")
+		if seasonID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing season id"})
+			return
+		}
+
+		limit := 10
+		if v := r.URL.Query().Get("limit"); v != "" {
+			var parsed int
+			if _, err := fmt.Sscanf(v, "%d", &parsed); err != nil || parsed <= 0 || parsed > 1000 {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "limit must be 1..1000"})
+				return
+			}
+			limit = parsed
+		}
+
+		key := fmt.Sprintf("lb:%s", seasonID)
+
+		ctx, cancel := context.WithTimeout(r.Context(), 300*time.Millisecond)
+		defer cancel()
+
+		// WITHSCORES=true
+		zs, err := rdb.ZRevRangeWithScores(ctx, key, 0, int64(limit-1)).Result()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "redis error"})
+			return
+		}
+
+		items := make([]leaderboardItem, 0, len(zs))
+		for _, z := range zs {
+			uid, ok := z.Member.(string)
+			if !ok {
+				uid = fmt.Sprint(z.Member)
+			}
+			items = append(items, leaderboardItem{
+				UserID: uid,
+				Score:  z.Score,
+			})
+		}
+
+		writeJSON(w, http.StatusOK, topResponse{
+			SeasonID: seasonID,
+			Items:    items,
+		})
+	})
+
 	fmt.Println("Leaderboard-go Server is starting on http://localhost:8080")
 	if err := http.ListenAndServe(":8080", mux); err != nil {
 		fmt.Println("Error starting server:", err)
