@@ -57,6 +57,7 @@ type aroundResponse struct {
 func main() {
 	rdb := newRedisClient()
 	db := newPostgresDB()
+	go runOutboxWorker(context.Background(), db, rdb)
 	defer db.Close()
 
 	mux := http.NewServeMux()
@@ -96,7 +97,7 @@ func main() {
 				return
 			}
 		}
-		
+
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":   "ready",
 			"redis":    "ok",
@@ -126,23 +127,51 @@ func main() {
 			return
 		}
 
-		// Key: "lb:{seasonID}"
-		key := fmt.Sprintf("lb:%s", seasonID)
-
-		ctx, cancel := context.WithTimeout(r.Context(), 300*time.Millisecond)
+		ctx, cancel := context.WithTimeout(r.Context(), 800*time.Millisecond)
 		defer cancel()
 
-		score, err := rdb.ZIncrBy(ctx, key, float64(req.Delta), req.UserID).Result()
+		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "redis error"})
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "db begin failed"})
+			return
+		}
+		defer tx.Rollback()
+
+		// 1) score_events 기록(원장)
+		if _, err := tx.ExecContext(ctx, `
+  INSERT INTO score_events (season_id, user_id, delta)
+  VALUES ($1,$2,$3)
+`, seasonID, req.UserID, req.Delta); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "db score_events insert failed"})
 			return
 		}
 
-		writeJSON(w, http.StatusOK, scoreUpdateResponse{
-			SeasonID: seasonID,
-			UserID:   req.UserID,
-			Score:    score,
+		// 2) outbox 기록(해야 할 일)
+		payload, _ := json.Marshal(map[string]any{
+			"seasonId": seasonID,
+			"userId":   req.UserID,
+			"delta":    req.Delta,
 		})
+		if _, err := tx.ExecContext(ctx, `
+  INSERT INTO outbox (event_type, payload, status)
+  VALUES ('score_delta', $1, 'pending')
+`, payload); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "db outbox insert failed"})
+			return
+		}
+
+		if err := tx.Commit(); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "db commit failed"})
+			return
+		}
+
+		// outbox 방식이면 202가 자연스러움(비동기 반영)
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"seasonId": seasonID,
+			"userId":   req.UserID,
+			"queued":   true,
+		})
+
 	})
 
 	// GET /v1/seasons/{sid}/leaderboard/top?limit=10
@@ -313,6 +342,7 @@ func main() {
 	})
 
 	// DELETE /v1/seasons/{sid}
+	// DELETE /v1/seasons/{sid}
 	mux.HandleFunc("DELETE /v1/seasons/{sid}", func(w http.ResponseWriter, r *http.Request) {
 		sid := r.PathValue("sid")
 		if sid == "" {
@@ -320,21 +350,137 @@ func main() {
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(r.Context(), 300*time.Millisecond)
+		ctx, cancel := context.WithTimeout(r.Context(), 800*time.Millisecond)
 		defer cancel()
 
+		// Delete Redis
 		key := fmt.Sprintf("lb:%s", sid)
 		if err := rdb.Del(ctx, key).Err(); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "redis error"})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"seasonId": sid, "deleted": true})
+
+		// Delete Postgres records
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "db begin failed"})
+			return
+		}
+		defer tx.Rollback()
+
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM score_events WHERE season_id=$1`, sid); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "score_events delete failed"})
+			return
+		}
+
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM outbox WHERE payload->>'seasonId'=$1`, sid); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "outbox delete failed"})
+			return
+		}
+
+		if err := tx.Commit(); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "db commit failed"})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"seasonId": sid,
+			"deleted":  true,
+		})
 	})
 
 	fmt.Println("Leaderboard-go Server is starting on http://localhost:8080")
 	if err := http.ListenAndServe(":8080", mux); err != nil {
 		fmt.Println("Error starting server:", err)
 	}
+}
+
+func runOutboxWorker(ctx context.Context, db *sql.DB, rdb *redis.Client) {
+	ticker := time.NewTicker(150 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = processOneOutbox(ctx, db, rdb)
+		}
+	}
+}
+
+func processOneOutbox(ctx context.Context, db *sql.DB, rdb *redis.Client) error {
+	c, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
+	defer cancel()
+
+	tx, err := db.BeginTx(c, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var id int64
+	var eventType string
+	var payload []byte
+
+	err = tx.QueryRowContext(c, `
+		SELECT id, event_type, payload
+		FROM outbox
+		WHERE status='pending'
+		ORDER BY id
+		FOR UPDATE SKIP LOCKED
+		LIMIT 1
+	`).Scan(&id, &eventType, &payload)
+
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(c, `
+		UPDATE outbox SET status='processing', attempts=attempts+1
+		WHERE id=$1
+	`, id); err != nil {
+		return err
+	}
+
+	var p struct {
+		SeasonID string `json:"seasonId"`
+		UserID   string `json:"userId"`
+		Delta    int64  `json:"delta"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		_, _ = tx.ExecContext(c, `
+			UPDATE outbox SET status='failed', last_error=$2
+			WHERE id=$1
+		`, id, "bad payload: "+err.Error())
+		return tx.Commit()
+	}
+
+	if eventType == "score_delta" {
+		key := fmt.Sprintf("lb:%s", p.SeasonID)
+		if err := rdb.ZIncrBy(c, key, float64(p.Delta), p.UserID).Err(); err != nil {
+			_, _ = tx.ExecContext(c, `
+				UPDATE outbox SET status='pending', last_error=$2
+				WHERE id=$1
+			`, id, "redis: "+err.Error())
+			return tx.Commit()
+		}
+	}
+
+	if _, err := tx.ExecContext(c, `
+		UPDATE outbox
+		SET status='done', processed_at=now(), last_error=NULL
+		WHERE id=$1
+	`, id); err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 func newRedisClient() *redis.Client {
