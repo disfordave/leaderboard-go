@@ -1,0 +1,423 @@
+openapi: 3.0.3
+info:
+  title: Game Leaderboard API
+  description: High-performance Real-time Leaderboard Service using Go, Redis, and PostgreSQL.
+  version: 1.0.0
+  contact:
+    name: GitHub Repository
+    url: https://github.com/disfordave/leaderboard-go
+
+servers:
+  - url: http://localhost:8080
+    description: Local Environment
+  - url: https://leaderboard-go.disfordave.com
+    description: Production Environment (GCP)
+
+tags:
+  - name: Probe
+    description: Health and readiness endpoints
+  - name: Scores
+    description: Score update endpoints
+  - name: Leaderboard
+    description: Leaderboard query endpoints
+  - name: Seasons
+    description: Season maintenance endpoints
+
+paths:
+  /healthz:
+    get:
+      tags: [Probe]
+      summary: Health Check
+      description: Returns service health status.
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /readyz:
+    get:
+      tags: [Probe]
+      summary: Readiness Check
+      description: Checks connections to Redis and PostgreSQL, and validates required schema exists.
+      responses:
+        '200':
+          description: All dependencies are ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+        '503':
+          description: Service unavailable (dependency or schema not ready)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotReadyResponse'
+
+  /v1/seasons/{sid}/scores:
+    post:
+      tags: [Scores]
+      summary: Update User Score
+      description: Submits a score update. Processed asynchronously via Outbox pattern.
+      parameters:
+        - in: path
+          name: sid
+          schema:
+            type: string
+          required: true
+          description: Season ID (e.g., "s1")
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScoreUpdateRequest'
+      responses:
+        '202':
+          description: Accepted (Queued for processing)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScoreUpdateAcceptedResponse'
+        '400':
+          description: Invalid request (missing/invalid seasonId, userId, delta, or JSON body)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error (DB transaction failure)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/seasons/{sid}/leaderboard/top:
+    get:
+      tags: [Leaderboard]
+      summary: Get Top N Leaderboard
+      parameters:
+        - in: path
+          name: sid
+          schema:
+            type: string
+          required: true
+          description: Season ID
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 10
+            minimum: 1
+            maximum: 1000
+          description: Number of items to return
+      responses:
+        '200':
+          description: Top N rankings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TopResponse'
+        '400':
+          description: Invalid request (missing seasonId or invalid limit)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Redis error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/seasons/{sid}/leaderboard/rank:
+    get:
+      tags: [Leaderboard]
+      summary: Get User Rank
+      parameters:
+        - in: path
+          name: sid
+          required: true
+          schema:
+            type: string
+          description: Season ID
+        - in: query
+          name: userId
+          required: true
+          schema:
+            type: string
+          description: User ID
+      responses:
+        '200':
+          description: User ranking info
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RankResponse'
+        '400':
+          description: Invalid request (missing seasonId or userId)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: User not found in leaderboard
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Redis error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/seasons/{sid}/leaderboard/around:
+    get:
+      tags: [Leaderboard]
+      summary: Get Rankings Around User
+      parameters:
+        - in: path
+          name: sid
+          required: true
+          schema:
+            type: string
+          description: Season ID
+        - in: query
+          name: userId
+          required: true
+          schema:
+            type: string
+          description: User ID
+        - in: query
+          name: range
+          schema:
+            type: integer
+            format: int64
+            default: 5
+            minimum: 0
+            maximum: 100
+          description: Range of neighbors to fetch (e.g., 5 means +/- 5)
+      responses:
+        '200':
+          description: Surrounding rankings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AroundResponse'
+        '400':
+          description: Invalid request (missing seasonId/userId or invalid range)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: User not found in leaderboard
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Redis error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/seasons/{sid}:
+    delete:
+      tags: [Seasons]
+      summary: Reset Season Data
+      description: Clears Redis leaderboard and PostgreSQL records for the season.
+      parameters:
+        - in: path
+          name: sid
+          required: true
+          schema:
+            type: string
+          description: Season ID
+      responses:
+        '200':
+          description: Season data deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeasonDeleteResponse'
+        '400':
+          description: Invalid request (missing seasonId)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Redis/DB error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "invalid json"
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+
+    ReadyResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ready
+        redis:
+          type: string
+          example: ok
+        postgres:
+          type: string
+          example: ok
+        schema:
+          type: string
+          example: ok
+
+    NotReadyResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: not_ready
+        redis:
+          type: string
+          example: down
+        postgres:
+          type: string
+          example: unknown
+        schema:
+          type: string
+          example: unknown
+
+    ScoreUpdateRequest:
+      type: object
+      required:
+        - userId
+        - delta
+      properties:
+        userId:
+          type: string
+          example: "user123"
+        delta:
+          type: integer
+          format: int64
+          description: Score delta (must be non-zero). Stored in PostgreSQL as BIGINT.
+          example: 100
+
+    ScoreUpdateAcceptedResponse:
+      type: object
+      properties:
+        seasonId:
+          type: string
+          example: "s1"
+        userId:
+          type: string
+          example: "user123"
+        queued:
+          type: boolean
+          example: true
+
+    LeaderboardItem:
+      type: object
+      properties:
+        userId:
+          type: string
+          example: "user123"
+        score:
+          type: number
+          format: double
+          description: Score value (Redis ZSET score is a double; logically treated as integer in this service)
+          example: 150
+
+    TopResponse:
+      type: object
+      properties:
+        seasonId:
+          type: string
+          example: "s1"
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/LeaderboardItem'
+
+    RankResponse:
+      type: object
+      properties:
+        seasonId:
+          type: string
+          example: "s1"
+        userId:
+          type: string
+          example: "user123"
+        rank:
+          type: integer
+          format: int64
+          description: 1-based rank (1 = highest score)
+          example: 3
+        score:
+          type: number
+          format: double
+          example: 120
+
+    AroundItem:
+      type: object
+      properties:
+        rank:
+          type: integer
+          format: int64
+          description: 1-based rank (1 = highest score)
+          example: 10
+        userId:
+          type: string
+          example: "user123"
+        score:
+          type: number
+          format: double
+          example: 99
+
+    AroundResponse:
+      type: object
+      properties:
+        seasonId:
+          type: string
+          example: "s1"
+        userId:
+          type: string
+          example: "user123"
+        range:
+          type: integer
+          format: int64
+          example: 5
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AroundItem'
+
+    SeasonDeleteResponse:
+      type: object
+      properties:
+        seasonId:
+          type: string
+          example: "s1"
+        deleted:
+          type: boolean
+          example: true
