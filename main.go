@@ -8,11 +8,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -86,6 +86,7 @@ func main() {
 					"status":   "not_ready",
 					"redis":    "down",
 					"postgres": "unknown",
+					"schema":   "unknown",
 				})
 				return
 			}
@@ -101,6 +102,23 @@ func main() {
 					"status":   "not_ready",
 					"redis":    "ok",
 					"postgres": "down",
+					"schema":   "unknown",
+				})
+				return
+			}
+		}
+
+		// Check schema
+		{
+			ctx, cancel := context.WithTimeout(r.Context(), 200*time.Millisecond)
+			defer cancel()
+
+			if _, err := db.ExecContext(ctx, `SELECT 1 FROM outbox LIMIT 1`); err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+					"status":   "not_ready",
+					"redis":    "ok",
+					"postgres": "ok",
+					"schema":   "missing",
 				})
 				return
 			}
@@ -110,6 +128,7 @@ func main() {
 			"status":   "ready",
 			"redis":    "ok",
 			"postgres": "ok",
+			"schema":   "ok",
 		})
 	})
 
@@ -132,6 +151,10 @@ func main() {
 		}
 		if req.UserID == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "userId is required"})
+			return
+		}
+		if req.Delta == 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "delta must be non-zero"})
 			return
 		}
 
@@ -489,12 +512,34 @@ func processBatchOutbox(ctx context.Context, db *sql.DB, rdb *redis.Client) erro
 		}
 		items = append(items, i)
 	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
 	if len(items) == 0 {
 		return nil
 	}
 
+	ids := make([]int64, 0, len(items))
+	for _, it := range items {
+		ids = append(ids, it.ID)
+	}
+
+	if _, err := tx.ExecContext(c, `
+	UPDATE outbox
+	SET status='processing', attempts=attempts+1
+	WHERE id = ANY($1)
+`, pq.Array(ids)); err != nil {
+		return fmt.Errorf("db processing update failed: %w", err)
+	}
+
 	pipe := rdb.Pipeline()
-	var successIDs []string
+
+	type cmdWithID struct {
+		id  int64
+		cmd *redis.FloatCmd
+	}
+	cmds := make([]cmdWithID, 0, len(items))
 
 	for _, item := range items {
 		var p struct {
@@ -503,36 +548,65 @@ func processBatchOutbox(ctx context.Context, db *sql.DB, rdb *redis.Client) erro
 			Delta    int64  `json:"delta"`
 		}
 		if err := json.Unmarshal(item.Payload, &p); err != nil {
-			tx.ExecContext(c, `UPDATE outbox SET status='failed', last_error=$2 WHERE id=$1`, item.ID, "json error: "+err.Error())
+			_, _ = tx.ExecContext(c,
+				`UPDATE outbox SET status='failed', last_error=$2 WHERE id=$1`,
+				item.ID, "json error: "+err.Error(),
+			)
 			continue
 		}
 
-		if item.EventType == "score_delta" {
-			key := fmt.Sprintf("lb:%s", p.SeasonID)
-			pipe.ZIncrBy(c, key, float64(p.Delta), p.UserID)
-			successIDs = append(successIDs, fmt.Sprintf("%d", item.ID))
+		if item.EventType != "score_delta" {
+			_, _ = tx.ExecContext(c,
+				`UPDATE outbox SET status='failed', last_error=$2 WHERE id=$1`,
+				item.ID, "unknown event_type: "+item.EventType,
+			)
+			continue
 		}
+
+		key := fmt.Sprintf("lb:%s", p.SeasonID)
+		cmd := pipe.ZIncrBy(c, key, float64(p.Delta), p.UserID)
+		cmds = append(cmds, cmdWithID{id: item.ID, cmd: cmd})
 	}
 
 	if _, err := pipe.Exec(c); err != nil {
 		return fmt.Errorf("redis pipeline failed: %w", err)
 	}
 
-	if len(successIDs) > 0 {
-		idParam := fmt.Sprintf("{%s}", strings.Join(successIDs, ","))
+	okIDs := make([]int64, 0, len(cmds))
+	failIDs := make([]int64, 0)
 
+	for _, x := range cmds {
+		if x.cmd.Err() != nil {
+			failIDs = append(failIDs, x.id)
+		} else {
+			okIDs = append(okIDs, x.id)
+		}
+	}
+
+	if len(okIDs) > 0 {
 		_, err := tx.ExecContext(c, `
-            UPDATE outbox
-            SET status='done', processed_at=now(), attempts=attempts+1
-            WHERE id = ANY($1::bigint[])
-        `, idParam)
-
+		UPDATE outbox
+		SET status='done', processed_at=now(), last_error=NULL
+		WHERE id = ANY($1)
+	`, pq.Array(okIDs))
 		if err != nil {
-			return fmt.Errorf("db bulk update failed: %w", err)
+			return fmt.Errorf("db bulk done update failed: %w", err)
+		}
+	}
+
+	if len(failIDs) > 0 {
+		_, err := tx.ExecContext(c, `
+		UPDATE outbox
+		SET status='pending', last_error='redis cmd error'
+		WHERE id = ANY($1)
+	`, pq.Array(failIDs))
+		if err != nil {
+			return fmt.Errorf("db bulk pending update failed: %w", err)
 		}
 	}
 
 	return tx.Commit()
+
 }
 
 func newRedisClient() *redis.Client {
