@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -58,8 +60,13 @@ type aroundResponse struct {
 func main() {
 	rdb := newRedisClient()
 	db := newPostgresDB()
-	go runOutboxWorker(context.Background(), db, rdb)
 	defer db.Close()
+	defer rdb.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go runOutboxWorker(ctx, db, rdb)
 
 	mux := http.NewServeMux()
 
@@ -391,10 +398,39 @@ func main() {
 		})
 	})
 
-	fmt.Println("Leaderboard-go Server is starting on http://localhost:8080")
-	if err := http.ListenAndServe(":8080", mux); err != nil {
-		fmt.Println("Error starting server:", err)
+	srv := &http.Server{
+		Addr:              ":8080",
+		Handler:           mux,
+		ReadHeaderTimeout: 3 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		fmt.Println("Leaderboard-go Server is starting on http://localhost:8080")
+		errCh <- srv.ListenAndServe()
+	}()
+
+	select {
+	case <-ctx.Done():
+		fmt.Println("Shutdown signal received")
+	case err := <-errCh:
+		if err != nil && err != http.ErrServerClosed {
+			fmt.Println("Server error:", err)
+		}
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		fmt.Println("Shutdown error:", err)
+	} else {
+		fmt.Println("Server stopped gracefully")
+	}
+
 }
 
 func runOutboxWorker(ctx context.Context, db *sql.DB, rdb *redis.Client) {
