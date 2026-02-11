@@ -518,8 +518,8 @@ func newPostgresDB() *sql.DB {
 		panic(err)
 	}
 
-	db.SetMaxOpenConns(20)
-	db.SetMaxIdleConns(20)
+	db.SetMaxOpenConns(50)
+	db.SetMaxIdleConns(50)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
