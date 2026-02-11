@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -342,7 +343,6 @@ func main() {
 	})
 
 	// DELETE /v1/seasons/{sid}
-	// DELETE /v1/seasons/{sid}
 	mux.HandleFunc("DELETE /v1/seasons/{sid}", func(w http.ResponseWriter, r *http.Request) {
 		sid := r.PathValue("sid")
 		if sid == "" {
@@ -398,89 +398,105 @@ func main() {
 }
 
 func runOutboxWorker(ctx context.Context, db *sql.DB, rdb *redis.Client) {
-	ticker := time.NewTicker(150 * time.Millisecond)
-	defer ticker.Stop()
+    ticker := time.NewTicker(50 * time.Millisecond)
+    defer ticker.Stop()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			_ = processOneOutbox(ctx, db, rdb)
-		}
-	}
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            if err := processBatchOutbox(ctx, db, rdb); err != nil {
+                if err != sql.ErrNoRows { 
+                    fmt.Println("Worker error:", err)
+                }
+            }
+        }
+    }
 }
 
-func processOneOutbox(ctx context.Context, db *sql.DB, rdb *redis.Client) error {
-	c, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
-	defer cancel()
+func processBatchOutbox(ctx context.Context, db *sql.DB, rdb *redis.Client) error {
+    const batchSize = 500
 
-	tx, err := db.BeginTx(c, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
+    c, cancel := context.WithTimeout(ctx, 5*time.Second)
+    defer cancel()
 
-	var id int64
-	var eventType string
-	var payload []byte
+    tx, err := db.BeginTx(c, nil)
+    if err != nil {
+        return err
+    }
+    defer tx.Rollback()
 
-	err = tx.QueryRowContext(c, `
-		SELECT id, event_type, payload
-		FROM outbox
-		WHERE status='pending'
-		ORDER BY id
-		FOR UPDATE SKIP LOCKED
-		LIMIT 1
-	`).Scan(&id, &eventType, &payload)
+    rows, err := tx.QueryContext(c, `
+        SELECT id, event_type, payload
+        FROM outbox
+        WHERE status='pending'
+        ORDER BY id
+        FOR UPDATE SKIP LOCKED
+        LIMIT $1
+    `, batchSize)
+    if err != nil {
+        return err
+    }
+    defer rows.Close()
 
-	if err == sql.ErrNoRows {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
+    type outboxItem struct {
+        ID        int64
+        EventType string
+        Payload   []byte
+    }
+    var items []outboxItem
+    for rows.Next() {
+        var i outboxItem
+        if err := rows.Scan(&i.ID, &i.EventType, &i.Payload); err != nil {
+            return err
+        }
+        items = append(items, i)
+    }
+    if len(items) == 0 {
+        return nil
+    }
 
-	if _, err := tx.ExecContext(c, `
-		UPDATE outbox SET status='processing', attempts=attempts+1
-		WHERE id=$1
-	`, id); err != nil {
-		return err
-	}
+    pipe := rdb.Pipeline()
+    var successIDs []string 
 
-	var p struct {
-		SeasonID string `json:"seasonId"`
-		UserID   string `json:"userId"`
-		Delta    int64  `json:"delta"`
-	}
-	if err := json.Unmarshal(payload, &p); err != nil {
-		_, _ = tx.ExecContext(c, `
-			UPDATE outbox SET status='failed', last_error=$2
-			WHERE id=$1
-		`, id, "bad payload: "+err.Error())
-		return tx.Commit()
-	}
+    for _, item := range items {
+        var p struct {
+            SeasonID string `json:"seasonId"`
+            UserID   string `json:"userId"`
+            Delta    int64  `json:"delta"`
+        }
+        if err := json.Unmarshal(item.Payload, &p); err != nil {
+            tx.ExecContext(c, `UPDATE outbox SET status='failed', last_error=$2 WHERE id=$1`, item.ID, "json error: "+err.Error())
+            continue
+        }
 
-	if eventType == "score_delta" {
-		key := fmt.Sprintf("lb:%s", p.SeasonID)
-		if err := rdb.ZIncrBy(c, key, float64(p.Delta), p.UserID).Err(); err != nil {
-			_, _ = tx.ExecContext(c, `
-				UPDATE outbox SET status='pending', last_error=$2
-				WHERE id=$1
-			`, id, "redis: "+err.Error())
-			return tx.Commit()
-		}
-	}
+        if item.EventType == "score_delta" {
+            key := fmt.Sprintf("lb:%s", p.SeasonID)
+            pipe.ZIncrBy(c, key, float64(p.Delta), p.UserID)
+            successIDs = append(successIDs, fmt.Sprintf("%d", item.ID))
+        }
+    }
 
-	if _, err := tx.ExecContext(c, `
-		UPDATE outbox
-		SET status='done', processed_at=now(), last_error=NULL
-		WHERE id=$1
-	`, id); err != nil {
-		return err
-	}
+    if _, err := pipe.Exec(c); err != nil {
+        return fmt.Errorf("redis pipeline failed: %w", err)
+    }
 
-	return tx.Commit()
+    if len(successIDs) > 0 {
+        idParam := fmt.Sprintf("{%s}", strings.Join(successIDs, ","))
+
+        _, err := tx.ExecContext(c, `
+            UPDATE outbox
+            SET status='done', processed_at=now(), attempts=attempts+1
+            WHERE id = ANY($1::bigint[])
+        `, idParam)
+        
+        if err != nil {
+            return fmt.Errorf("db bulk update failed: %w", err)
+        }
+    }
+
+    return tx.Commit()
 }
 
 func newRedisClient() *redis.Client {
