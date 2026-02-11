@@ -9,6 +9,7 @@ services:
     depends_on:
       - redis
       - postgres
+    restart: unless-stopped
     networks:
       - backend
   redis:
