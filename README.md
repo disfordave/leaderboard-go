@@ -129,6 +129,18 @@ Worker가 DB 커넥션을 과점하여 API 요청이 타임아웃 발생
 
 ## 🏃‍♂️ How to Run
 
+### Clone repository
+
+```git clone
+git clone
+cd leaderboard-go
+```
+
+### .env file
+
+```cp .env.example .env
+```
+
 ### Start services
 
 ```
