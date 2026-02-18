@@ -122,7 +122,7 @@ Worker가 DB 커넥션을 과점하여 API 요청이 타임아웃 발생
 * Language: Go 1.24
 * Database: PostgreSQL 16, Redis 7
 * Libraries: pgx/v5, go-redis/v9
-* Infra: Docker, Docker Compose, GCP Compute Engine
+* Infra: Docker, Docker Compose, AWS (EC2, VPC), Terraform, GCP Compute Engine (leaderboard-go.disfordave.com)
 * Testing: k6
 
 ---
@@ -138,7 +138,8 @@ cd leaderboard-go
 
 ### .env file
 
-```cp .env.example .env
+```
+cp .env.example .env
 ```
 
 ### Start services
@@ -165,6 +166,31 @@ docker run --rm -i --network=host -e VUS=100 grafana/k6 run - < k6/get_top.js
 
 ```
 watch -n 1 'docker exec -it leaderboard-go-postgres psql -U leaderboard -d leaderboard -c "select status, count(*) from outbox group by status;"'
+```
+
+---
+
+## ☁️ Infrastructure & Deployment
+
+AWS 환경에서의 안정적이고 재현 가능한 배포를 위해 **Terraform**을 활용하여
+VPC, Subnet, Internet Gateway, Security Group 등 네트워크 계층부터 EC2 인스턴스 프로비저닝까지의 전 과정을 코드로 관리(IaC)합니다.
+
+* **Automated Provisioning**: `terraform apply` 명령어 하나로 격리된 네트워크 환경과 서버를 즉시 구축합니다.
+* **Bootstrapping**: EC2 User Data 스크립트를 활용하여, 인스턴스 부팅 시 Docker 설치 및 최신 애플리케이션 배포가 자동으로 수행됩니다.
+
+### Deploy to AWS
+
+```bash
+cd terraform
+
+# Initialize Terraform
+terraform init
+
+# Check execution plan
+terraform plan
+
+# Apply infrastructure changes
+terraform apply
 ```
 
 ---
