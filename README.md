@@ -17,24 +17,31 @@ POST 요청은 Redis에 직접 쓰지 않고, PostgreSQL 트랜잭션을 통해 
 
 **Transactional Outbox Pattern**을 적용하여 API 요청 시점에는 DB에 이벤트만 기록하고(Atomic), 별도의 Worker가 비동기로 Redis에 반영합니다.
 
-```mermaid
-graph LR
-    Client([Client])
-    API[Go API Server]
-    DB[(PostgreSQL)]
-    Redis[(Redis Cache)]
-    
-    subgraph "Transactional Boundary"
-        API -->|1. Insert Score & Event| DB
-    end
-    
-    subgraph "Outbox Worker (Background)"
-        DB -->|2. Batch Fetch (SKIP LOCKED)| API
-        API -->|3. Pipeline Update| Redis
-        API -->|4. Bulk Status Update| DB
-    end
-
-    Client -.->|5. Get Ranking (Real-time)| Redis
+```text
+[ Client ]
+    |
+    | (1) POST /scores
+    v
+[ Go API Server ]
+    |
+    | (1) Insert Score & Event (Tx)
+    v
+[ PostgreSQL (DB) ]
+    |
+    | (2) Batch Fetch (FOR UPDATE SKIP LOCKED)
+    +-----------------------+
+                            |
+                            v
+                    [ Outbox Worker ]
+                            |
+                            | (3) Redis Pipeline (ZIncrBy)
+                            v
+                    [ Redis Cache ] <. . . . . . [ Client ]
+                            |                      (5) Get Rank
+                            |
+                            | (4) Update Status (Done)
+                            v
+                    [ PostgreSQL (DB) ]
 ```
 
 ---
